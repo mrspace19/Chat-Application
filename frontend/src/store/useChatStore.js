@@ -1,9 +1,10 @@
+// useChatStore.js
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import toast from "react-hot-toast";
 import { axiosInstance } from "../lib/axios";
 import { useAuthStore } from "./useAuthStore";
-import { decryptMessage, encryptMessage } from "../lib/encryption";
+// Encryption is handled by the backend
 
 export const useChatStore = create(
   persist(
@@ -15,15 +16,27 @@ export const useChatStore = create(
       isMessagesLoading: false,
       _hasHydrated: false, // Track hydration
 
-      getUsers: async () => {
-        set({ isUsersLoading: true });
+      sendMessage: async (messageData) => {
+        const { selectedUser } = get();
+        if (!selectedUser) return;
+
         try {
-          const res = await axiosInstance.get("/messages/users");
-          set({ users: res.data });
+          // Optimistically update the UI
+          const tempId = Date.now();
+          const newMessage = {
+            ...messageData,
+            _id: tempId,
+            senderId: useAuthStore.getState().authUser._id,
+            receiverId: selectedUser._id,
+            createdAt: new Date().toISOString(),
+          };
+          set((state) => ({ messages: [...state.messages, newMessage] }));
+
+          await axiosInstance.post(`/messages/send/${selectedUser._id}`, messageData);
         } catch (error) {
-          toast.error(error.response.data.message);
-        } finally {
-          set({ isUsersLoading: false });
+          toast.error(error.response?.data?.message || "Failed to send message.");
+          // Revert optimistic update on failure if desired
+          set((state) => ({ messages: state.messages.filter(msg => msg._id !== tempId) }));
         }
       },
 
@@ -31,34 +44,24 @@ export const useChatStore = create(
         set({ isMessagesLoading: true });
         try {
           const res = await axiosInstance.get(`/messages/${userId}`);
-          const decryptedMessages = res.data.map((msg) => ({
-            ...msg,
-            text: decryptMessage(msg.text),
-          }));
-          set({ messages: decryptedMessages });
+          // Messages are already decrypted by the backend
+          set({ messages: res.data });
         } catch (error) {
-          toast.error(error.response.data.message);
+          toast.error(error.response?.data?.message || "Failed to fetch messages.");
         } finally {
           set({ isMessagesLoading: false });
         }
       },
 
-      sendMessage: async (messageData) => {
-        const { selectedUser, messages } = get();
+      getUsers: async () => {
+        set({ isUsersLoading: true });
         try {
-          const encryptedText = encryptMessage(messageData.text);
-          const res = await axiosInstance.post(`/messages/send`, {
-            ...messageData,
-            text: encryptedText,
-            receiverId: selectedUser._id,
-          });
-          const decryptedMessage = {
-            ...res.data,
-            text: messageData.text,
-          };
-          set({ messages: [...messages, decryptedMessage] });
+          const res = await axiosInstance.get("/messages/users");
+          set({ users: res.data });
         } catch (error) {
-          toast.error(error.response.data.message);
+          toast.error(error.response?.data?.message || "Failed to fetch users.");
+        } finally {
+          set({ isUsersLoading: false });
         }
       },
 
@@ -72,20 +75,28 @@ export const useChatStore = create(
           if (!newMessage.senderId || !newMessage.receiverId) return;
 
           const myId = useAuthStore.getState().authUser._id;
-          const isForMe =
-            newMessage.senderId === selectedUser._id ||
-            newMessage.receiverId === selectedUser._id;
+          const isForSelectedChat =
+            (newMessage.senderId === selectedUser._id && newMessage.receiverId === myId) ||
+            (newMessage.receiverId === selectedUser._id && newMessage.senderId === myId);
 
-          if (!isForMe) return;
+          if (!isForSelectedChat) return;
 
-          const decryptedMessage = {
-            ...newMessage,
-            text: newMessage.text ? decryptMessage(newMessage.text) : "",
-          };
+          // Check if message already exists to prevent duplicates
+          const existingMessages = get().messages;
+          const messageExists = existingMessages.some(msg => 
+            msg._id === newMessage._id || 
+            (msg.senderId === newMessage.senderId && 
+             msg.receiverId === newMessage.receiverId && 
+             msg.text === newMessage.text && 
+             Math.abs(new Date(msg.createdAt) - new Date(newMessage.createdAt)) < 1000) // Within 1 second
+          );
 
-          set({
-            messages: [...get().messages, decryptedMessage],
-          });
+          if (!messageExists) {
+            // Messages from socket are already decrypted by the backend
+            set({
+              messages: [...existingMessages, newMessage],
+            });
+          }
         });
       },
 
@@ -100,7 +111,7 @@ export const useChatStore = create(
       name: "chat-store",
       partialize: (state) => ({ selectedUser: state.selectedUser }),
       onRehydrateStorage: () => (state) => {
-        state._hasHydrated = true; 
+        state._hasHydrated = true;
       },
     }
   )

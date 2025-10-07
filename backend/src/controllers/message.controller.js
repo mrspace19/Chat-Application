@@ -1,8 +1,9 @@
+// message.controller.js
 import User from "../models/user.model.js";
 import Message from "../models/message.model.js";
-import cloudinary from "../lib/cloudinary.js";
-import { encrypt, decrypt } from "../lib/encryption.js";
+import mongoose from "mongoose";
 import { getReceiverSocketId, io } from "../lib/socket.js";
+import { encrypt, decrypt } from "../lib/encryption.js";
 
 export const getUsersForSidebar = async (req, res) => {
   try {
@@ -15,26 +16,26 @@ export const getUsersForSidebar = async (req, res) => {
   }
 };
 
-
 export const getMessages = async (req, res) => {
-   try {
-    console.log("🔍 Backend getMessages called:");
-    console.log("Requester (req.user._id):", req.user._id);
-    console.log("Chatting with (req.params.userId):", req.params.userId);
-    
-    const { userId } = req.params;
+  try {
+    const { userId } = req.params; // Changed to use userId directly from params
+    const loggedInUserId = req.user._id;
+
     const messages = await Message.find({
       $or: [
-        { senderId: req.user._id, receiverId: userId },
-        { senderId: userId, receiverId: req.user._id },
+        { senderId: loggedInUserId, receiverId: new mongoose.Types.ObjectId(userId) },
+        { senderId: new mongoose.Types.ObjectId(userId), receiverId: loggedInUserId },
       ],
     }).sort({ createdAt: 1 });
 
     // Decrypt messages before sending them to the frontend
-    const decryptedMessages = messages.map((msg) => ({
-      ...msg._doc,
-      text: decrypt(msg.text),
-    }));
+    const decryptedMessages = messages.map((msg) => {
+      const decryptedText = msg.text ? decrypt(msg.text) : "";
+      return {
+        ...msg._doc,
+        text: decryptedText,
+      };
+    });
 
     res.status(200).json(decryptedMessages);
   } catch (error) {
@@ -45,35 +46,43 @@ export const getMessages = async (req, res) => {
 
 export const sendMessage = async (req, res) => {
   try {
-    const { text, receiverId } = req.body;
+    const { text, image } = req.body;
+    const receiverId = req.params.userId;
     const senderId = req.user._id;
 
-    // Encrypt the text before saving it to the database
-    const encryptedText = encrypt(text);
+    if (!text && !image) {
+      return res.status(400).json({ error: "Message content is required" });
+    }
+
+    const encryptedText = encrypt(text); // This is where you encrypt the message
 
     const newMessage = new Message({
       senderId,
       receiverId,
       text: encryptedText,
+      image,
     });
 
     await newMessage.save();
-
-    // Decrypt the message to send back to frontend
+    
+    // Decrypt the message for the real-time update
     const decryptedMessage = {
       ...newMessage._doc,
-      text: decrypt(newMessage.text), // 💥 Decrypt here for both sender & receiver
+      text: text, // Use the original unencrypted text for the socket event
     };
 
-    // Emit the decrypted message to both sender and receiver via WebSockets
     const receiverSocketId = getReceiverSocketId(receiverId);
     if (receiverSocketId) {
       io.to(receiverSocketId).emit('newMessage', decryptedMessage);
     }
+    
+    // If the sender has their chat open with the receiver, update their chat as well
+    const senderSocketId = getReceiverSocketId(senderId);
+    if (senderSocketId && senderSocketId !== receiverSocketId) {
+      io.to(senderSocketId).emit('newMessage', decryptedMessage);
+    }
 
-    io.to(req.user.socketId).emit('newMessage', decryptedMessage);
-
-    res.status(201).json(decryptedMessage);
+    res.status(201).json(decryptedMessage); // Return the unencrypted message to sender
   } catch (error) {
     console.error('Error in sendMessage:', error);
     res.status(500).json({ error: 'Internal server error' });
